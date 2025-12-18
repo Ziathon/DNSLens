@@ -7,6 +7,9 @@ DnsLens collects:
 - **Records** per zone (CSV per zone + combined CSV)
 - Optional: **DNS Analytical log summaries** (to visualise/query “how DNS operates”)
 - Optional: **Topology diagram** (DOT always, PNG/SVG if GraphViz is installed)
+- Optional: **Interlinked DNS server map** that shows how resolvers chain to one another
+- Optional: **DNS event log review** (errors/warnings) with per-server summaries
+- Optional: **Best-practices reports** with remediation suggestions per server and run
 
 It always writes a **gaps report** stating what it couldn’t collect and why.
 
@@ -30,6 +33,14 @@ Set-Location C:\Temp
   -Diagram -DiagramFormat png
 ```
 
+## Add DNS error log review and best-practice guidance
+```powershell
+.\DnsLens.ps1 -OutputPath C:\Temp\DnsLens `
+  -CollectConfig -CollectZones -CollectRecords `
+  -CollectErrorEvents -ErrorLookbackHours 48 `
+  -Diagram -GenerateBestPractices
+```
+
 ## Target multiple DNS servers (requires permissions/remoting)
 ```powershell
 .\DnsLens.ps1 -ComputerName dc1,dc2 -OutputPath \\server\share\DnsLens `
@@ -39,8 +50,9 @@ Set-Location C:\Temp
 ## Outputs
 - `inventory/` – zones + records exports
 - `config/` – forwarders, conditional forwarders, config JSON
-- `logs/` – parsed DNS Analytical events + summaries (top QNAME, destination, QTYPE)
-- `diagrams/` – `dns_topology.dot` (+ `.png`/`.svg` if enabled)
+- `logs/` – parsed DNS Analytical events + summaries (top QNAME, destination, QTYPE) and DNS error/warning events when enabled
+- `diagrams/` – `dns_topology.dot` (+ `.png`/`.svg` if enabled) per server and `dns_interlink` overview
+- `best_practices*.md` – per-server and summary remediation guidance when enabled
 - `gaps/` – `gaps.csv` and `gaps.json` listing anything missing
 
 ## Notes / limitations
