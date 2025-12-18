@@ -45,9 +45,15 @@ param(
   [ValidateRange(1, 240)]
   [int] $QueryCaptureMinutes = 15,
 
+  [switch] $CollectErrorEvents,
+  [ValidateRange(1, 720)]
+  [int] $ErrorLookbackHours = 24,
+
   [switch] $Diagram,
   [ValidateSet("png","svg","dot")]
   [string] $DiagramFormat = "png",
+
+  [bool] $GenerateBestPractices = $true,
 
   # Zone filtering
   [string[]] $IncludeZone = @(),   # wildcard patterns, e.g. "*.corp.contoso.com"
@@ -326,6 +332,28 @@ function Summarise-DnsQueries {
   return @{ ok=$true; gap=$null; note="Captured and summarised DNS analytical events from $logName." }
 }
 
+function Get-DnsErrorEvents {
+  param(
+    [Parameter(Mandatory=$true)][string]$Computer,
+    [Parameter(Mandatory=$true)][int]$LookbackHours
+  )
+
+  $sb = {
+    param($hours)
+    $start = (Get-Date).AddHours(-1 * [math]::Abs($hours))
+    $providers = @("Microsoft-Windows-DNS-Server-Service", "DNS-Server-Service", "Microsoft-Windows-DNS-Client")
+    $filter = @{ LogName = "System"; ProviderName = $providers; StartTime = $start; Level = 1,2,3 }
+    try {
+      Get-WinEvent -FilterHashtable $filter -ErrorAction Stop |
+        Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, Message
+    } catch {
+      @()
+    }
+  }
+
+  Invoke-Remote -Computer $Computer -ScriptBlock $sb -ArgumentList @($LookbackHours)
+}
+
 function Get-DnsConfig {
   param([Parameter(Mandatory=$true)][string]$Computer)
 
@@ -418,6 +446,24 @@ function Export-DnsZoneFiles {
     $results += [pscustomobject]$r
   }
   $results
+}
+
+function Get-ServerIPAddresses {
+  param([Parameter(Mandatory=$true)][string]$Computer)
+
+  $sb = {
+    try {
+      Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
+        Select-Object -ExpandProperty IPAddress
+    } catch {
+      @()
+    }
+  }
+
+  $ips = @()
+  try { $ips = Invoke-Remote -Computer $Computer -ScriptBlock $sb } catch { $ips = @() }
+  $ips | Where-Object { $_ } | Select-Object -Unique
 }
 
 function Test-GraphViz {
@@ -578,6 +624,182 @@ function New-DnsTopologyDot {
   return ($dot -join "`n")
 }
 
+function New-DnsInterlinkDot {
+  param(
+    [Parameter(Mandatory=$true)]$ServersData
+  )
+
+  $dot = @()
+  $dot += "digraph DNS_INTERLINK {"
+  $dot += "  rankdir=LR;"
+  $dot += "  node [shape=box, style=rounded];"
+
+  $ipToServer = @{}
+  foreach ($sd in $ServersData) {
+    foreach ($ip in ($sd.IPAddresses | Where-Object { $_ })) {
+      if (-not $ipToServer.ContainsKey($ip)) { $ipToServer[$ip] = @() }
+      $ipToServer[$ip] += $sd.Server
+    }
+  }
+
+  foreach ($sd in $ServersData) {
+    $dot += f'  "{($sd.Server.ToUpper())}" [shape=box, style="rounded,filled"];'
+  }
+
+  $edgeLines = New-Object System.Collections.Generic.List[string]
+  $nodeLines = New-Object System.Collections.Generic.List[string]
+
+  foreach ($sd in $ServersData) {
+    $serverNode = $sd.Server.ToUpper()
+    $cfg = $sd.Config
+
+    # Forwarders
+    $forwarders = @()
+    if ($cfg -and $cfg.Forwarders) {
+      foreach ($f in $cfg.Forwarders) {
+        if ($f.IPAddress) { $forwarders += ($f.IPAddress | ForEach-Object { $_.ToString() }) }
+      }
+    }
+    $forwarders = $forwarders | Where-Object { $_ } | Select-Object -Unique
+
+    foreach ($ip in $forwarders) {
+      $targets = $ipToServer[$ip]
+      if ($targets -and $targets.Count -gt 0) {
+        foreach ($t in ($targets | Select-Object -Unique)) {
+          $edgeLines.Add(f'  "{serverNode}" -> "{t.ToUpper()}" [label="Forwarder"];')
+        }
+      } else {
+        $nodeLines.Add(f'  "FWD {ip}" [shape=box];')
+        $edgeLines.Add(f'  "{serverNode}" -> "FWD {ip}" [label="Forwarder"];')
+      }
+    }
+
+    # Conditional forwarders
+    $condZones = @()
+    if ($cfg -and $cfg.ConditionalForwarders) {
+      foreach ($cz in $cfg.ConditionalForwarders) {
+        $ips = @()
+        try { $ips = $cz.MasterServers | ForEach-Object { $_.IPAddress.ToString() } } catch {}
+        $condZones += [pscustomobject]@{ ZoneName=$cz.Name; Masters=($ips | Where-Object { $_ } | Select-Object -Unique) }
+      }
+    }
+
+    foreach ($cz in $condZones) {
+      $zoneNode = "CFZ " + $cz.ZoneName
+      $nodeLines.Add(f'  "{zoneNode}" [shape=folder];')
+      $edgeLines.Add(f'  "{serverNode}" -> "{zoneNode}" [label="Conditional forward"];')
+      foreach ($m in $cz.Masters) {
+        $targets = $ipToServer[$m]
+        if ($targets -and $targets.Count -gt 0) {
+          foreach ($t in ($targets | Select-Object -Unique)) {
+            $edgeLines.Add(f'  "{zoneNode}" -> "{t.ToUpper()}" [label="Master"];')
+          }
+        } else {
+          $nodeLines.Add(f'  "CFM {m}" [shape=box];')
+          $edgeLines.Add(f'  "{zoneNode}" -> "CFM {m}" [label="Master"];')
+        }
+      }
+    }
+  }
+
+  foreach ($line in ($nodeLines | Select-Object -Unique)) { $dot += $line }
+  foreach ($line in ($edgeLines | Select-Object -Unique)) { $dot += $line }
+
+  $dot += "}"
+  return ($dot -join "`n")
+}
+
+function Write-BestPracticesReport {
+  param(
+    [Parameter(Mandatory=$true)][string]$Server,
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$false)]$Config,
+    [Parameter(Mandatory=$false)]$Zones,
+    [Parameter(Mandatory=$false)]$ErrorEvents
+  )
+
+  $observations = New-Object System.Collections.Generic.List[string]
+  $remediations = New-Object System.Collections.Generic.List[string]
+
+  if (-not $Config) {
+    $observations.Add("DNS configuration was not captured; best-practices review is limited.")
+    $remediations.Add("Re-run DnsLens with -CollectConfig to enable configuration-aware guidance.")
+  } else {
+    $hasForwarders = $false
+    if ($Config.Forwarders) {
+      foreach ($f in $Config.Forwarders) { if ($f.IPAddress -and $f.IPAddress.Count -gt 0) { $hasForwarders = $true; break } }
+    }
+    if (-not $hasForwarders -and (-not $Config.RootHints -or $Config.RootHints.Count -eq 0)) {
+      $observations.Add("No forwarders or root hints detected; recursive resolution may fail or depend on stale caches.")
+      $remediations.Add("Configure upstream forwarders (e.g., internal resolvers or trusted public DNS) or repopulate root hints.")
+    }
+
+    if ($Config.Scavenging -and ($Config.Scavenging | Get-Member -Name "ScavengingState" -ErrorAction SilentlyContinue)) {
+      if (-not $Config.Scavenging.ScavengingState) {
+        $observations.Add("Scavenging is disabled; stale records may accumulate.")
+        $remediations.Add("Enable scavenging with conservative intervals on the DNS server and zones once timestamps are accurate.")
+      }
+    }
+
+    if ($Config.Recursion -and ($Config.Recursion | Get-Member -Name "EnableRecursion" -ErrorAction SilentlyContinue)) {
+      if (-not $Config.Recursion.EnableRecursion) {
+        $observations.Add("Recursion is disabled; clients can only resolve zones hosted or forwarded explicitly.")
+        $remediations.Add("Leave recursion disabled intentionally or document the design; otherwise enable recursion or forwarders.")
+      }
+    }
+
+    if ($Zones) {
+      $staticZones = $Zones | Where-Object { $_.DynamicUpdate -and $_.DynamicUpdate -eq "None" }
+      if ($staticZones.Count -gt 0) {
+        $znames = ($staticZones | Select-Object -First 5 | ForEach-Object { $_.ZoneName }) -join ", "
+        $observations.Add("One or more zones block dynamic updates: $znames.")
+        $remediations.Add("Review whether zones should permit secure dynamic updates to reduce manual record drift.")
+      }
+    }
+  }
+
+  if ($ErrorEvents -and $ErrorEvents.Count -gt 0) {
+    $errors = $ErrorEvents | Where-Object { $_.LevelDisplayName -eq "Error" }
+    $warnings = $ErrorEvents | Where-Object { $_.LevelDisplayName -eq "Warning" }
+    if ($errors.Count -gt 0) { $observations.Add("Detected $($errors.Count) DNS error events in the lookback window.") }
+    if ($warnings.Count -gt 0) { $observations.Add("Detected $($warnings.Count) DNS warning events in the lookback window.") }
+    $remediations.Add("Address the most frequent DNS Server error IDs first (e.g., replication, zone load, or network binding issues).")
+  }
+
+  if ($remediations.Count -eq 0) {
+    $remediations.Add("No blocking issues detected in collected data. Maintain monitoring and validation of DNS logs and backups.")
+  }
+
+  $lines = @()
+  $lines += "# DNS Best Practices – $Server"
+  $lines += ""
+  $lines += "## Observations"
+  if ($observations.Count -gt 0) {
+    foreach ($o in $observations) { $lines += "- $o" }
+  } else {
+    $lines += "- No critical observations based on collected data."
+  }
+  $lines += ""
+  $lines += "## Remediation steps"
+  foreach ($r in ($remediations | Select-Object -Unique)) { $lines += "- $r" }
+  $lines += ""
+  $lines += "## General DNS hygiene checklist"
+  $lines += "- Monitor DNS event logs regularly and alert on error or warning IDs."
+  $lines += "- Keep DNS servers patched and validate backup/restore of zone data."
+  $lines += "- Restrict recursion to trusted clients and prefer secure dynamic updates."
+  $lines += "- Validate forwarders or root hints availability and latency."
+  $lines += "- Enable auditing/logging for query patterns when investigating client issues."
+
+  $lines | Out-File -FilePath $Path -Encoding UTF8
+
+  return [pscustomobject]@{
+    Server = $Server
+    Observations = $observations
+    Remediations = $remediations
+    Path = $Path
+  }
+}
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -625,6 +847,8 @@ $allFwdRows     = @()
 $allCondRows    = @()
 $allZoneExports = @()
 $allNotes       = @()
+$serverSummaries= @()
+$allBestPracticeSummaries = @()
 
 foreach ($c in $ComputerName) {
   $server = $c
@@ -647,6 +871,15 @@ foreach ($c in $ComputerName) {
 
   $config = $null
   $zones  = @()
+  $dnsErrorEvents = @()
+  $serverIps = @()
+
+  try {
+    $serverIps = Get-ServerIPAddresses -Computer $server
+  } catch {
+    $serverIps = @()
+    $gaps.Add([pscustomobject]@{ Category="Collection"; Item="IP addresses"; Server=$server; Gap=$_.Exception.Message; Recommendation="Ensure remoting and networking cmdlets are allowed to gather server bindings." })
+  }
 
   # Config
   if ($CollectConfig) {
@@ -794,6 +1027,28 @@ foreach ($c in $ComputerName) {
     }
   }
 
+  if ($CollectErrorEvents) {
+    Write-Info "Reviewing DNS-related errors/warnings on $server for last $ErrorLookbackHours hours"
+    try {
+      $dnsErrorEvents = Get-DnsErrorEvents -Computer $server -LookbackHours $ErrorLookbackHours
+      if ($dnsErrorEvents -and $dnsErrorEvents.Count -gt 0) {
+        Export-CsvSafe -Object $dnsErrorEvents -Path (Join-Path $serverLogDir "dns_errors.csv")
+
+        $topIds = $dnsErrorEvents | Group-Object Id | Sort-Object Count -Descending | Select-Object -First 5 @{n="EventId";e={$_.Name}}, Count
+        if ($topIds) {
+          Export-CsvSafe -Object $topIds -Path (Join-Path $serverLogDir "dns_error_eventid_summary.csv")
+        }
+
+        $allNotes += [pscustomobject]@{ Server=$server; Note="Captured $($dnsErrorEvents.Count) DNS error/warning events in last $ErrorLookbackHours hours." }
+      } else {
+        $allNotes += [pscustomobject]@{ Server=$server; Note="No DNS error or warning events found in last $ErrorLookbackHours hours." }
+      }
+    } catch {
+      $gaps.Add([pscustomobject]@{ Category="Logging"; Item="DNS event log"; Server=$server; Gap=$_.Exception.Message; Recommendation="Ensure System log is accessible via remoting and DNS Server/Client providers are present." })
+      Write-Warn "DNS event log review failed on $server: $($_.Exception.Message)"
+    }
+  }
+
   # Diagram
   if ($Diagram) {
     if (-not $config) {
@@ -830,6 +1085,68 @@ foreach ($c in $ComputerName) {
       }
     }
   }
+
+  if ($GenerateBestPractices) {
+    $bpPath = Join-Path $serverDir "best_practices.md"
+    try {
+      $bp = Write-BestPracticesReport -Server $server -Path $bpPath -Config $config -Zones $zones -ErrorEvents $dnsErrorEvents
+      $allBestPracticeSummaries += $bp
+    } catch {
+      $gaps.Add([pscustomobject]@{ Category="Guidance"; Item="Best practices"; Server=$server; Gap=$_.Exception.Message; Recommendation="Ensure configuration and zone data are collected to enable best-practice hints." })
+    }
+  }
+
+  $serverSummaries += [pscustomobject]@{
+    Server = $server
+    Config = $config
+    Zones = $zones
+    IPAddresses = $serverIps
+  }
+}
+
+if ($Diagram -and $serverSummaries.Count -gt 0) {
+  try {
+    $interlinkDot = New-DnsInterlinkDot -ServersData $serverSummaries
+    $interlinkPath = Join-Path $diaDir "dns_interlink.dot"
+    Write-DotFile -Path $interlinkPath -Dot $interlinkDot
+
+    if ($DiagramFormat -eq "dot") {
+      Write-Info "Interlink diagram DOT written: $interlinkPath"
+    } elseif ($graphVizAvailable) {
+      $interImg = Join-Path $diaDir ("dns_interlink." + $DiagramFormat)
+      try {
+        Render-Dot -DotPath $interlinkPath -OutPath $interImg -Format $DiagramFormat
+        Write-Info "Interlink diagram rendered: $interImg"
+      } catch {
+        $gaps.Add([pscustomobject]@{ Category="Diagram"; Item="Interlink Render"; Server="All"; Gap=$_.Exception.Message; Recommendation="Ensure GraphViz dot.exe is installed and accessible." })
+      }
+    } else {
+      Write-Info "Interlink DOT written (GraphViz not available to render image): $interlinkPath"
+    }
+  } catch {
+    $gaps.Add([pscustomobject]@{ Category="Diagram"; Item="Interlink"; Server="All"; Gap=$_.Exception.Message; Recommendation="Inspect DNS config collection and rerun diagram generation." })
+  }
+}
+
+if ($allBestPracticeSummaries.Count -gt 0) {
+  $bpLines = @("# DNS Best Practices Summary")
+  foreach ($bp in $allBestPracticeSummaries) {
+    $bpLines += ""
+    $bpLines += "## $($bp.Server)"
+    if ($bp.Observations -and $bp.Observations.Count -gt 0) {
+      $bpLines += "### Observations"
+      foreach ($o in $bp.Observations) { $bpLines += "- $o" }
+    }
+    if ($bp.Remediations -and $bp.Remediations.Count -gt 0) {
+      $bpLines += "### Remediation steps"
+      foreach ($r in ($bp.Remediations | Select-Object -Unique)) { $bpLines += "- $r" }
+    }
+    $bpLines += "### Detailed report"
+    $bpLines += "- $($bp.Path)"
+  }
+
+  $bpSummaryPath = Join-Path $runDir "best_practices_summary.md"
+  $bpLines | Out-File -FilePath $bpSummaryPath -Encoding UTF8
 }
 
 # Export combined outputs
