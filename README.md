@@ -7,6 +7,7 @@ DnsLens collects:
 - **Records** per zone (CSV per zone + combined CSV)
 - Optional: **DNS Analytical log summaries** (to visualise/query “how DNS operates”)
 - Optional: **Topology diagram** (DOT always, PNG/SVG if GraphViz is installed)
+- Optional: **Best-practice assessment + customer-ready PDF report** with prioritized next steps
 
 It always writes a **gaps report** stating what it couldn’t collect and why.
 
@@ -26,7 +27,7 @@ Set-Location C:\Temp
 ```powershell
 .\DnsLens.ps1 -OutputPath C:\Temp\DnsLens `
   -CollectConfig -CollectZones -CollectRecords `
-  -CaptureQueries -QueryCaptureMinutes 15 -ForceEnableAnalyticalLog `
+  -CaptureQueries -QueryCaptureMinutes 15 -ForceEnableAnalyticalLog -GenerateReport -CustomerName "Acme Corp" `
   -Diagram -DiagramFormat png
 ```
 
@@ -41,6 +42,7 @@ Set-Location C:\Temp
 - `config/` – forwarders, conditional forwarders, config JSON
 - `logs/` – parsed DNS Analytical events + summaries (top QNAME, destination, QTYPE)
 - `diagrams/` – `dns_topology.dot` (+ `.png`/`.svg` if enabled)
+- `reports/` – best-practice findings (`.csv/.json`) + `dns_assessment_report.pdf`
 - `gaps/` – `gaps.csv` and `gaps.json` listing anything missing
 
 ## Notes / limitations

@@ -60,7 +60,10 @@ param(
 
   [switch] $ForceEnableAnalyticalLog,  # will attempt to enable analytical logging if disabled
   [switch] $IncludeTopClientsInDiagram, # uses captured query summary (if available)
-  [int] $TopClients = 10
+  [int] $TopClients = 10,
+
+  [switch] $GenerateReport,
+  [string] $CustomerName = "Customer"
 )
 
 Set-StrictMode -Version Latest
@@ -444,6 +447,138 @@ function Render-Dot {
   & dot -T$Format $DotPath -o $OutPath | Out-Null
 }
 
+function ConvertTo-PdfEscapedText {
+  param([Parameter(Mandatory=$true)][string]$Text)
+  $t = $Text -replace '\\','\\'
+  $t = $t -replace '\(','\('
+  $t = $t -replace '\)','\)'
+  return $t
+}
+
+function New-SimplePdfReport {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$true)][string[]]$Lines
+  )
+
+  # Minimal PDF writer for text reports (single page stream with standard Helvetica font)
+  $lineHeight = 14
+  $startX = 50
+  $startY = 792
+  $ops = New-Object System.Collections.Generic.List[string]
+  $ops.Add("BT")
+  $ops.Add("/F1 10 Tf")
+  $ops.Add("$startX $startY Td")
+  foreach ($line in $Lines) {
+    $safe = ConvertTo-PdfEscapedText -Text $line
+    $ops.Add("($safe) Tj")
+    $ops.Add("0 -$lineHeight Td")
+  }
+  $ops.Add("ET")
+  $streamData = ($ops -join "`n")
+  $streamBytes = [System.Text.Encoding]::ASCII.GetBytes($streamData)
+
+  $obj1 = "1 0 obj`n<< /Type /Catalog /Pages 2 0 R >>`nendobj`n"
+  $obj2 = "2 0 obj`n<< /Type /Pages /Kids [3 0 R] /Count 1 >>`nendobj`n"
+  $obj3 = "3 0 obj`n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>`nendobj`n"
+  $obj4 = "4 0 obj`n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>`nendobj`n"
+  $obj5Header = "5 0 obj`n<< /Length $($streamBytes.Length) >>`nstream`n"
+  $obj5Footer = "`nendstream`nendobj`n"
+
+  $ms = New-Object System.IO.MemoryStream
+  $writer = New-Object System.IO.BinaryWriter($ms, [System.Text.Encoding]::ASCII)
+  $offsets = New-Object System.Collections.Generic.List[int]
+
+  function Write-Ascii([System.IO.BinaryWriter]$w, [string]$text) {
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($text)
+    $w.Write($bytes)
+  }
+
+  Write-Ascii $writer "%PDF-1.4`n"
+
+  $offsets.Add([int]$ms.Position); Write-Ascii $writer $obj1
+  $offsets.Add([int]$ms.Position); Write-Ascii $writer $obj2
+  $offsets.Add([int]$ms.Position); Write-Ascii $writer $obj3
+  $offsets.Add([int]$ms.Position); Write-Ascii $writer $obj4
+  $offsets.Add([int]$ms.Position)
+  Write-Ascii $writer $obj5Header
+  $writer.Write($streamBytes)
+  Write-Ascii $writer $obj5Footer
+
+  $xrefPos = [int]$ms.Position
+  Write-Ascii $writer "xref`n0 6`n"
+  Write-Ascii $writer "0000000000 65535 f `n"
+  foreach ($off in $offsets) {
+    Write-Ascii $writer ("{0:0000000000} 00000 n `n" -f $off)
+  }
+  Write-Ascii $writer "trailer`n<< /Size 6 /Root 1 0 R >>`nstartxref`n$xrefPos`n%%EOF`n"
+  $writer.Flush()
+  [System.IO.File]::WriteAllBytes($Path, $ms.ToArray())
+  $writer.Dispose()
+  $ms.Dispose()
+}
+
+function Get-DnsBestPracticeFindings {
+  param(
+    [Parameter(Mandatory=$true)][string]$Server,
+    [Parameter(Mandatory=$false)]$Config,
+    [Parameter(Mandatory=$true)]$Zones,
+    [Parameter(Mandatory=$true)]$Records
+  )
+
+  $findings = New-Object System.Collections.Generic.List[object]
+  $priority = 1
+  function Add-Finding {
+    param($name,$status,$detail,$impact,$nextStep)
+    $script:findings.Add([pscustomobject]@{
+      Server = $Server
+      Check = $name
+      Status = $status
+      Detail = $detail
+      Impact = $impact
+      NextStep = $nextStep
+      Priority = $script:priority
+    })
+    $script:priority++
+  }
+
+  if ($Config) {
+    $fwdCount = @($Config.Forwarders).Count
+    if ($fwdCount -ge 2) {
+      Add-Finding "Forwarders resiliency" "Pass" "Configured forwarders: $fwdCount" "Good resilience for external resolution." "Keep at least two healthy forwarders."
+    } elseif ($fwdCount -eq 1) {
+      Add-Finding "Forwarders resiliency" "Warn" "Only one forwarder configured." "Single point of failure for recursive queries." "Add at least one additional trusted forwarder."
+    } else {
+      Add-Finding "Forwarders resiliency" "Warn" "No forwarders configured." "External resolution depends on root hints/recursion path only." "Define forwarders or confirm this design is intentional."
+    }
+
+    if ($Config.Scavenging -and $Config.Scavenging.ScavengingState) {
+      Add-Finding "DNS scavenging" "Pass" "Scavenging is enabled." "Helps remove stale records and reduce lookup drift." "Review no-refresh/refresh windows quarterly."
+    } else {
+      Add-Finding "DNS scavenging" "Warn" "Scavenging appears disabled or unavailable." "Stale records can increase outage risk and troubleshooting time." "Enable scavenging and validate aging settings."
+    }
+  } else {
+    Add-Finding "Configuration visibility" "Warn" "Config collection was not available." "Assessment is partial and may miss high-risk settings." "Rerun with -CollectConfig and required permissions."
+  }
+
+  $zoneCount = @($Zones).Count
+  if ($zoneCount -gt 0) {
+    Add-Finding "Zone inventory" "Pass" "Discovered $zoneCount zones." "Inventory baseline is available for governance." "Track monthly drift and unauthorized additions."
+  } else {
+    Add-Finding "Zone inventory" "Warn" "No zones were discovered." "Authoritative surface is unknown." "Verify permissions/role and collect zones again."
+  }
+
+  $recordCount = @($Records).Count
+  if ($recordCount -gt 0) {
+    $stale = @($Records | Where-Object { $_.Timestamp -and $_.Timestamp -ne $null }).Count
+    Add-Finding "Record coverage" "Pass" "Collected $recordCount records ($stale timestamped)." "Provides detailed visibility for cleanup and risk analysis." "Use this baseline for change control."
+  } else {
+    Add-Finding "Record coverage" "Warn" "No records collected." "Cannot detect risky entries, stale hosts, or gaps." "Run with -CollectRecords and review zone errors."
+  }
+
+  return $findings
+}
+
 function New-DnsTopologyDot {
   param(
     [Parameter(Mandatory=$true)][string]$Computer,
@@ -507,7 +642,7 @@ function New-DnsTopologyDot {
   $dot += "digraph DNS_TOPOLOGY {"
   $dot += "  rankdir=LR;"
   $dot += "  node [shape=box, style=rounded];"
-  $dot += f'  "{serverNode}" [shape=box, style="rounded,filled"];'
+  $dot += "  `"$serverNode`" [shape=box, style=`"rounded,filled`"];"
 
   # Clients cluster
   if ($clientNodes.Count -gt 0) {
@@ -515,32 +650,32 @@ function New-DnsTopologyDot {
     $dot += '    label="Observed Clients (from Analytical log Destination)";'
     $dot += "    style=rounded;"
     foreach ($c in $clientNodes) {
-      $dot += f'    "{c}" [shape=ellipse];'
-      $dot += f'    "{c}" -> "{serverNode}" [label="DNS query"];'
+      $dot += "    `"$c`" [shape=ellipse];"
+      $dot += "    `"$c`" -> `"$serverNode`" [label=`"DNS query`"];"
     }
     $dot += "  }"
   } else {
     # still show a generic client box to explain flow
     $dot += '  "Clients" [shape=ellipse];'
-    $dot += f'  "Clients" -> "{serverNode}" [label="DNS query"];'
+    $dot += "  `"Clients`" -> `"$serverNode`" [label=`"DNS query`"];"
   }
 
   # Forwarders / Root hints
   if ($forwarders.Count -gt 0) {
     foreach ($ip in $forwarders) {
-      $dot += f'  "FWD {ip}" [shape=box];'
-      $dot += f'  "{serverNode}" -> "FWD {ip}" [label="Forwarder"];'
+      $dot += "  `"FWD $ip`" [shape=box];"
+      $dot += "  `"$serverNode`" -> `"FWD $ip`" [label=`"Forwarder`"];"
     }
   } else {
     # If no forwarders, show root hints path
     if ($rootHints.Count -gt 0) {
       foreach ($ip in $rootHints) {
-        $dot += f'  "RootHint {ip}" [shape=box];'
-        $dot += f'  "{serverNode}" -> "RootHint {ip}" [label="Root Hints"];'
+        $dot += "  `"RootHint $ip`" [shape=box];"
+        $dot += "  `"$serverNode`" -> `"RootHint $ip`" [label=`"Root Hints`"];"
       }
     } else {
       $dot += '  "Internet/Upstream DNS" [shape=box];'
-      $dot += f'  "{serverNode}" -> "Internet/Upstream DNS" [label="Recursion"];'
+      $dot += "  `"$serverNode`" -> `"Internet/Upstream DNS`" [label=`"Recursion`"];"
     }
   }
 
@@ -551,11 +686,11 @@ function New-DnsTopologyDot {
     $dot += "    style=rounded;"
     foreach ($cz in $condZones) {
       $zn = $cz.ZoneName
-      $dot += f'    "CFZ {zn}" [shape=folder];'
-      $dot += f'    "{serverNode}" -> "CFZ {zn}" [label="Conditional forward"];'
+      $dot += "    `"CFZ $zn`" [shape=folder];"
+      $dot += "    `"$serverNode`" -> `"CFZ $zn`" [label=`"Conditional forward`"];"
       foreach ($m in $cz.Masters) {
-        $dot += f'    "CFM {m}" [shape=box];'
-        $dot += f'    "CFZ {zn}" -> "CFM {m}" [label="Master"];'
+        $dot += "    `"CFM $m`" [shape=box];"
+        $dot += "    `"CFZ $zn`" -> `"CFM $m`" [label=`"Master`"];"
       }
     }
     $dot += "  }"
@@ -568,8 +703,8 @@ function New-DnsTopologyDot {
     $dot += "    style=rounded;"
     foreach ($z in $zonesList) {
       $zn = $z.ZoneName
-      $dot += f'    "ZONE {zn}" [shape=component];'
-      $dot += f'    "{serverNode}" -> "ZONE {zn}" [label="Authoritative"];'
+      $dot += "    `"ZONE $zn`" [shape=component];"
+      $dot += "    `"$serverNode`" -> `"ZONE $zn`" [label=`"Authoritative`"];"
     }
     $dot += "  }"
   }
@@ -592,12 +727,14 @@ $cfgDir  = Join-Path $runDir "config"
 $logDir  = Join-Path $runDir "logs"
 $diaDir  = Join-Path $runDir "diagrams"
 $gapDir  = Join-Path $runDir "gaps"
+$repDir  = Join-Path $runDir "reports"
 
 New-Directory -Path $invDir
 New-Directory -Path $cfgDir
 New-Directory -Path $logDir
 New-Directory -Path $diaDir
 New-Directory -Path $gapDir
+New-Directory -Path $repDir
 
 $gaps = New-Object System.Collections.Generic.List[object]
 
@@ -625,6 +762,7 @@ $allFwdRows     = @()
 $allCondRows    = @()
 $allZoneExports = @()
 $allNotes       = @()
+$allFindings    = @()
 
 foreach ($c in $ComputerName) {
   $server = $c
@@ -638,12 +776,14 @@ foreach ($c in $ComputerName) {
   $serverLogDir = Join-Path $serverDir "logs"
   $serverDiaDir = Join-Path $serverDir "diagrams"
   $serverGapDir = Join-Path $serverDir "gaps"
+  $serverRepDir = Join-Path $serverDir "reports"
 
   New-Directory -Path $serverInvDir
   New-Directory -Path $serverCfgDir
   New-Directory -Path $serverLogDir
   New-Directory -Path $serverDiaDir
   New-Directory -Path $serverGapDir
+  New-Directory -Path $serverRepDir
 
   $config = $null
   $zones  = @()
@@ -830,6 +970,49 @@ foreach ($c in $ComputerName) {
       }
     }
   }
+
+  if ($GenerateReport) {
+    try {
+      $serverRecords = @($allRecordRows | Where-Object { $_.Server -eq $server })
+      $findings = Get-DnsBestPracticeFindings -Server $server -Config $config -Zones $zones -Records $serverRecords
+      $allFindings += $findings
+
+      Export-CsvSafe -Object $findings -Path (Join-Path $serverRepDir "best_practice_findings.csv")
+      Export-JsonSafe -Object $findings -Path (Join-Path $serverRepDir "best_practice_findings.json") -Depth 6
+
+      $reportLines = @()
+      $reportLines += "DNS Lens Assessment Report"
+      $reportLines += "Customer: $CustomerName"
+      $reportLines += "Server: $server"
+      $reportLines += "Generated: $(Get-Date -Format s) UTC"
+      $reportLines += ""
+      $reportLines += "Executive Summary"
+      $reportLines += "Zones discovered: $(@($zones).Count)"
+      $reportLines += "Records collected: $(@($serverRecords).Count)"
+      $reportLines += ""
+      $reportLines += "Best Practice Findings"
+      foreach ($f in $findings) {
+        $reportLines += "[$($f.Status)] $($f.Check): $($f.Detail)"
+        $reportLines += "  Impact: $($f.Impact)"
+        $reportLines += "  Next step: $($f.NextStep)"
+      }
+      $reportLines += ""
+      $reportLines += "Customer Next Steps"
+      foreach ($f in ($findings | Where-Object { $_.Status -eq "Warn" })) {
+        $reportLines += "- $($f.NextStep)"
+      }
+      if (@($findings | Where-Object { $_.Status -eq "Warn" }).Count -eq 0) {
+        $reportLines += "- Continue periodic DNS baseline reviews and monitor query behavior."
+      }
+
+      $pdfPath = Join-Path $serverRepDir "dns_assessment_report.pdf"
+      New-SimplePdfReport -Path $pdfPath -Lines $reportLines
+      Write-Info "Assessment report generated: $pdfPath"
+    } catch {
+      $gaps.Add([pscustomobject]@{ Category="Reporting"; Item="PDF report"; Server=$server; Gap=$_.Exception.Message; Recommendation="Review report generation functions and permissions on output directory." })
+      Write-Warn "Report generation failed on $server: $($_.Exception.Message)"
+    }
+  }
 }
 
 # Export combined outputs
@@ -839,6 +1022,10 @@ if ($allFwdRows.Count -gt 0) { Export-CsvSafe -Object $allFwdRows -Path (Join-Pa
 if ($allCondRows.Count -gt 0) { Export-CsvSafe -Object $allCondRows -Path (Join-Path $cfgDir "all_conditional_forwarders.csv") }
 if ($allZoneExports.Count -gt 0) { Export-CsvSafe -Object $allZoneExports -Path (Join-Path $invDir "all_zone_export_results.csv") }
 if ($allNotes.Count -gt 0) { Export-CsvSafe -Object $allNotes -Path (Join-Path $runDir "notes.csv") }
+if ($allFindings.Count -gt 0) {
+  Export-CsvSafe -Object $allFindings -Path (Join-Path $repDir "all_best_practice_findings.csv")
+  Export-JsonSafe -Object $allFindings -Path (Join-Path $repDir "all_best_practice_findings.json") -Depth 6
+}
 
 # Gaps report (explicitly tells you what couldn't be collected / why)
 $gapsPathCsv = Join-Path $gapDir "gaps.csv"
